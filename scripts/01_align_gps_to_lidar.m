@@ -1,33 +1,69 @@
-%% STEP 1: Load Data
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% Script:
+%   01_align_gps_to_lidar.m
+%
+% Purpose:
+%   Align a LiDAR point cloud with a GPS trajectory by converting GPS
+%   coordinates from WGS84 to a local ENU coordinate frame and estimating
+%   the rigid-body transformation between the datasets.
+%
+% Inputs:
+%   fixed.pcd
+%   trajectory_xyzyaw.csv
+%
+% Outputs:
+%   aligned_lidar.pcd
+%   alignment_transform.mat
+%   GPS vs LiDAR verification plots
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-ptCloud = pcread('fixed.pcd');
-gpsData = readtable('trajectory_xyzyaw.csv');
+clc;
+clear;
+close all;
 
-%% STEP 2: GPS -> ENU
+%% Parameters
+
+pcdFile = 'fixed.pcd';
+gpsFile = 'trajectory_xyzyaw.csv';
+
+sampleWindow = 100;
+manualYawOffsetDeg = 3;
+
+%% Step 1 - Load Data
+
+ptCloud = pcread(pcdFile);
+gpsData = readtable(gpsFile);
+
+%% Step 2 - Convert GPS (WGS84) to ENU
 
 latitudes  = gpsData.x;
 longitudes = gpsData.y;
 altitudes  = gpsData.z;
 
-lat0 = latitudes(1);
-lon0 = longitudes(1);
-alt0 = altitudes(1);
+originLat = latitudes(1);
+originLon = longitudes(1);
+originAlt = altitudes(1);
 
-[E,N,U] = geodetic2enu( ...
-    latitudes, ...
-    longitudes, ...
-    altitudes, ...
-    lat0, ...
-    lon0, ...
-    alt0, ...
-    wgs84Ellipsoid);
+wgs84 = wgs84Ellipsoid;
 
-gpsTrajectoryMeters = [E,N,U];
+[east,north,up] = geodetic2enu( ...
+    latitudes,...
+    longitudes,...
+    altitudes,...
+    originLat,...
+    originLon,...
+    originAlt,...
+    wgs84);
 
-% Start trajectory at origin
-normTraj = gpsTrajectoryMeters - gpsTrajectoryMeters(1,:);
+gpsENU = [east north up];
 
-%% STEP 3: Prepare Point Cloud
+% Normalize trajectory
+
+gpsENU = gpsENU - gpsENU(1,:);
+
+%% Step 3 - Prepare LiDAR Point Cloud
 
 cloudXYZ = ptCloud.Location;
 
@@ -36,95 +72,110 @@ validIdx = ~isnan(cloudXYZ(:,1)) & ...
 
 cloudXYZ = cloudXYZ(validIdx,:);
 
-% Start cloud at origin
 cloudXYZ = cloudXYZ - cloudXYZ(1,:);
 
-%% STEP 4: Automatic Heading Alignment
+%% Step 4 - Estimate Heading Difference
 
-gpsVec = normTraj(end,1:2) - normTraj(1,1:2);
+gpsVec = gpsENU(end,1:2) - gpsENU(1,1:2);
 
-cloudVec = mean(cloudXYZ(end-100:end,1:2),1) - ...
-           mean(cloudXYZ(1:100,1:2),1);
+cloudVec = ...
+    mean(cloudXYZ(end-sampleWindow:end,1:2),1) - ...
+    mean(cloudXYZ(1:sampleWindow,1:2),1);
 
-gpsYaw   = atan2(gpsVec(2),gpsVec(1));
+gpsYaw = atan2(gpsVec(2),gpsVec(1));
+
 cloudYaw = atan2(cloudVec(2),cloudVec(1));
 
 yawCorrection = gpsYaw - cloudYaw;
 
-fprintf('GPS Heading   : %.2f deg\n',rad2deg(gpsYaw));
-fprintf('Cloud Heading : %.2f deg\n',rad2deg(cloudYaw));
-fprintf('Rotation      : %.2f deg\n',rad2deg(yawCorrection));
+yawCorrection = yawCorrection + ...
+                deg2rad(manualYawOffsetDeg);
 
-% Fine tuning from your latest plot
-yawCorrection = yawCorrection + deg2rad(3);
+fprintf('\n');
+fprintf('GPS Heading      : %.2f deg\n',rad2deg(gpsYaw));
+fprintf('LiDAR Heading    : %.2f deg\n',rad2deg(cloudYaw));
+fprintf('Applied Rotation : %.2f deg\n',rad2deg(yawCorrection));
 
-R = [cos(yawCorrection) -sin(yawCorrection) 0;
+%% Step 5 - Rotate LiDAR
+
+rotationMatrix = ...
+    [cos(yawCorrection) -sin(yawCorrection) 0;
      sin(yawCorrection)  cos(yawCorrection) 0;
      0                   0                  1];
 
-rotatedCloudXYZ = (R * cloudXYZ')';
+rotatedCloudXYZ = ...
+    (rotationMatrix * cloudXYZ')';
 
-%% STEP 5: Centroid Alignment
+%% Step 6 - Translate LiDAR
 
-gpsCenter = mean(normTraj(:,1:3),1);
-cloudCenter = mean(rotatedCloudXYZ(:,1:3),1);
+gpsCenter = mean(gpsENU);
 
-translation = gpsCenter - cloudCenter;
+cloudCenter = mean(rotatedCloudXYZ);
 
-% Ignore height during alignment
-translation(3) = 0;
+translationVector = gpsCenter - cloudCenter;
 
-finalCloudXYZ = rotatedCloudXYZ + translation;
+translationVector(3) = 0;
 
-%% STEP 6: Create Aligned Point Cloud
+alignedCloudXYZ = ...
+    rotatedCloudXYZ + translationVector;
+
+%% Step 7 - Create Aligned Point Cloud
 
 alignedPtCloud = pointCloud( ...
-    finalCloudXYZ, ...
-    'Intensity', ptCloud.Intensity(validIdx));
+    alignedCloudXYZ,...
+    'Intensity',ptCloud.Intensity(validIdx));
 
-%% STEP 7: Top-Down Verification
+%% Step 8 - Top View Verification
 
-figure('Name','2D Alignment');
+figure('Color','w');
 
-scatter(finalCloudXYZ(:,1), ...
-        finalCloudXYZ(:,2), ...
+scatter(alignedCloudXYZ(:,1),...
+        alignedCloudXYZ(:,2),...
         1,'.');
 
-hold on;
+hold on
 
-plot(normTraj(:,1), ...
-     normTraj(:,2), ...
-     'm', ...
-     'LineWidth',3);
+plot(gpsENU(:,1),...
+     gpsENU(:,2),...
+     'm',...
+     'LineWidth',3)
 
-axis equal;
-grid on;
+axis equal
+grid on
 
-xlabel('East (m)');
-ylabel('North (m)');
-title('Top View Alignment');
+xlabel('East (m)')
+ylabel('North (m)')
 
-legend('LiDAR Map','GPS Trajectory');
+title('LiDAR vs GPS (ENU)')
 
-%% STEP 8: 3D Verification
+legend('LiDAR','GPS')
 
-figure('Name','LiDAR Map vs GPS');
+%% Step 9 - 3D Verification
 
-pcshow(alignedPtCloud);
-hold on;
+figure('Color','w');
 
-plot3(normTraj(:,1), ...
-      normTraj(:,2), ...
-      normTraj(:,3), ...
-      'm-', ...
-      'LineWidth',5);
+pcshow(alignedPtCloud)
 
-xlabel('East (m)');
-ylabel('North (m)');
-zlabel('Up (m)');
+hold on
 
-title('LiDAR Map vs GPS Trajectory');
+plot3(gpsENU(:,1),...
+      gpsENU(:,2),...
+      gpsENU(:,3),...
+      'm',...
+      'LineWidth',4)
 
-grid on;
+xlabel('East (m)')
+ylabel('North (m)')
+zlabel('Up (m)')
 
-legend('LiDAR Map','GPS Trajectory');
+title('Aligned LiDAR Point Cloud')
+
+%% Step 10 - Save Results
+
+pcwrite(alignedPtCloud,...
+    '../results/aligned_lidar.pcd');
+
+save('../results/alignment_transform.mat',...
+     'rotationMatrix',...
+     'translationVector',...
+     'yawCorrection');
